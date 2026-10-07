@@ -339,6 +339,8 @@
     { "path": "./packages/interaction/permission-presets" },
     { "path": "./packages/experimental/auto-review" },
     { "path": "./packages/core/tools" },
+    { "path": "./packages/managed/tool-load-instructions" },
+    { "path": "./packages/managed/tool-vps-readonly" },
     { "path": "./packages/core/agent-tool-presentation" },
     { "path": "./packages/skill/skill" },
     { "path": "./packages/skill/skill-badge" },
