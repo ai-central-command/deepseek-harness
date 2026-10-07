@@ -46,3 +46,9 @@ worktrees/
 .agents/worktrees/
 .typert-*/
 native/system/test/bin/
+
+# Local timestamped editing snapshots; originals are preserved in local-evidence.
+/pnpm-lock.yaml.bak.*
+/packages/managed/**/src/*.bak.*
+/packages/managed/**/tests/*.bak.*
+/packages/managed/**/README.md.bak.*
