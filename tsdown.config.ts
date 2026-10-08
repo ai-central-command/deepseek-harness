@@ -22,7 +22,8 @@ export default defineConfig(({ env }) => {
     workspace: client
       ? ['vendor/*', 'packages/*/*', 'apps/cli']
       : ['vendor/*', 'packages/*/*', 'apps/cli', 'apps/desktop-host'],
-    entry: client ? '' : ['lib/types/{index,startup}.js'],
+    // The repository root has no runtime entry; workspace packages own their entries.
+    entry: '',
     outDir: 'lib',
     format: ['esm'],
     platform: 'node',

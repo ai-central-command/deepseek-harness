@@ -11,6 +11,9 @@
     "directory": "packages/core/tools"
   },
   "type": "module",
+  "scripts": {
+    "build:host": "tsdown --config tsdown.config.ts --config-loader native --no-workspace"
+  },
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
   "exports": {
