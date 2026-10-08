@@ -6,7 +6,7 @@ const SSH_TARGET = 'private@167.233.253.110'
 const APPROVED_ROOT = '/srv/ai-hub'
 const MAX_OUTPUT_BYTES = 64 * 1024
 
-/** @type {readonly ['vps_list', 'vps_find', 'vps_read', 'vps_git_status', 'vps_git_log', 'vps_search_read', 'vps_repo_summary']} */
+/** @type {readonly ['vps_list', 'vps_find', 'vps_read', 'vps_git_status', 'vps_git_log', 'vps_search_read', 'vps_search_content', 'vps_repo_summary']} */
 export const TOOL_NAMES = Object.freeze([
   'vps_list',
   'vps_find',
@@ -14,6 +14,7 @@ export const TOOL_NAMES = Object.freeze([
   'vps_git_status',
   'vps_git_log',
   'vps_search_read',
+  'vps_search_content',
   'vps_repo_summary',
 ])
 
@@ -47,6 +48,13 @@ export const TOOL_SCHEMAS = Object.freeze({
     start_line: { type: 'string', required: true, description: 'One-based decimal integer from 1 to 10,000.' },
     max_lines: { type: 'string', required: true, description: 'Decimal integer from 1 to 300.' },
   },
+  vps_search_content: {
+    pattern: { type: 'string', required: true, description: 'Literal ASCII text to find; control and shell metacharacters are rejected.' },
+    path: { type: 'string', description: 'Absolute search directory under /srv/ai-hub; defaults to /srv/ai-hub.' },
+    max_matches: { type: 'string', description: 'Decimal integer from 1 to 200; default 50.' },
+    max_files: { type: 'string', description: 'Decimal integer from 1 to 10,000; default 10,000.' },
+    max_file_bytes: { type: 'string', description: 'Decimal integer from 1 to 8 MiB; default 8 MiB.' },
+  },
   vps_repo_summary: {
     repo: { type: 'string', required: true, description: 'Absolute repository directory under /srv/ai-hub.' },
     max_entries: { type: 'string', required: true, description: 'Decimal integer from 1 to 50.' },
@@ -56,6 +64,7 @@ export const TOOL_SCHEMAS = Object.freeze({
 
 const PATH_SAFE = /^[A-Za-z0-9._/-]+$/
 const NAME_SAFE = /^[A-Za-z0-9._ -]{1,128}$/
+const CONTENT_PATTERN_SAFE = /^[A-Za-z0-9._:/ -]{1,256}$/
 
 function assertBoundedInteger(value, name, fallback, max) {
   let selected = value === undefined ? fallback : value
@@ -143,6 +152,21 @@ export function validateArguments(name, args) {
         max_lines: assertBoundedInteger(args.max_lines, 'max_lines', 200, 300),
       }
     }
+    case 'vps_search_content': {
+      if (Object.keys(args).some(key => !['pattern', 'path', 'max_matches', 'max_files', 'max_file_bytes'].includes(key))) {
+        throw new Error('vps_search_content accepts only pattern, path, max_matches, max_files, and max_file_bytes')
+      }
+      if (typeof args.pattern !== 'string' || !CONTENT_PATTERN_SAFE.test(args.pattern) || Buffer.byteLength(args.pattern, 'utf8') > 256) {
+        throw new Error('pattern must be 1 to 256 bytes of literal ASCII text without control or shell metacharacters')
+      }
+      return {
+        pattern: args.pattern,
+        path: validatePath(args.path === undefined ? APPROVED_ROOT : args.path),
+        max_matches: assertBoundedInteger(args.max_matches, 'max_matches', 50, 200),
+        max_files: assertBoundedInteger(args.max_files, 'max_files', 10000, 10000),
+        max_file_bytes: assertBoundedInteger(args.max_file_bytes, 'max_file_bytes', 8 * 1024 * 1024, 8 * 1024 * 1024),
+      }
+    }
     case 'vps_repo_summary':
       return {
         repo: validatePath(args.repo, 'repo'),
@@ -162,6 +186,7 @@ APPROVED_ROOT = '/srv/ai-hub'
 MAX_BYTES = 65536
 PATH_SAFE = re.compile(r'^[A-Za-z0-9._/-]+$')
 NAME_SAFE = re.compile(r'^[A-Za-z0-9._ -]{1,128}$')
+CONTENT_PATTERN_SAFE = re.compile(r'^[A-Za-z0-9._:/ -]{1,256}$')
 
 def fail(message):
     raise ValueError(message)
@@ -185,14 +210,14 @@ def bounded(value):
     raw = json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     if len(raw) <= MAX_BYTES:
         return raw
-    for key in ('entries', 'results', 'candidates', 'lines', 'recent_commits', 'commits'):
+    for key in ('entries', 'results', 'matches', 'candidates', 'lines', 'recent_commits', 'commits'):
         rows = value.get(key)
         if isinstance(rows, list):
             while rows and len(json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8')) > MAX_BYTES:
                 rows.pop()
                 truncation = value.get('truncated')
                 if isinstance(truncation, dict):
-                    truncation['commits' if key in ('recent_commits', 'commits') else 'entries'] = True
+                    truncation['commits' if key in ('recent_commits', 'commits') else 'matches' if key == 'matches' else 'entries'] = True
                 else:
                     value['truncated'] = True
             raw = json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
@@ -337,6 +362,107 @@ def search_read(root, name, match, result_index, start, count):
     return dict(metadata, status='ok', selected_index=selected, selected_path=selected_path,
                 start_line=start, lines=len(lines),
                 truncated=found['truncated'] or excerpt['truncated'], content=content)
+
+def search_content(root, pattern, max_matches, max_files, max_file_bytes):
+    if not isinstance(pattern, str) or not CONTENT_PATTERN_SAFE.fullmatch(pattern) or len(pattern.encode('utf-8')) > 256:
+        fail('pattern must be 1 to 256 bytes of literal ASCII text without control or shell metacharacters')
+    max_matches = checked_limit(max_matches, 50, 200, 'max_matches')
+    max_files = checked_limit(max_files, 10000, 10000, 'max_files')
+    max_file_bytes = checked_limit(max_file_bytes, 8 * 1024 * 1024, 8 * 1024 * 1024, 'max_file_bytes')
+    root_real = checked_path(root, 'path')
+    if not os.path.isdir(root_real):
+        fail('path is not a directory')
+    deadline = time.monotonic() + 20
+    matches = []
+    files_examined = 0
+    inaccessible = 0
+    skipped_binary = 0
+    skipped_oversized = 0
+    skipped_invalid_text = 0
+    truncated = False
+    walk_errors = [0]
+    for current, dirs, files in os.walk(root_real, topdown=True, followlinks=False,
+                                        onerror=lambda _error: walk_errors.__setitem__(0, walk_errors[0] + 1)):
+        if time.monotonic() >= deadline or files_examined >= max_files or len(matches) >= max_matches:
+            truncated = True
+            break
+        dirs.sort()
+        files.sort()
+        kept_dirs = []
+        for dirname in dirs:
+            candidate = os.path.join(current, dirname)
+            try:
+                resolved = os.path.realpath(candidate)
+                if os.path.islink(candidate) or not (resolved == APPROVED_ROOT or resolved.startswith(APPROVED_ROOT + os.sep)):
+                    continue
+                if resolved != root_real and not resolved.startswith(root_real + os.sep):
+                    continue
+                kept_dirs.append(dirname)
+            except OSError:
+                inaccessible += 1
+        dirs[:] = kept_dirs
+        for filename in files:
+            if time.monotonic() >= deadline or files_examined >= max_files or len(matches) >= max_matches:
+                truncated = True
+                break
+            candidate = os.path.join(current, filename)
+            try:
+                if os.path.islink(candidate) or not os.path.isfile(candidate):
+                    continue
+                resolved = os.path.realpath(candidate)
+                if not (resolved == APPROVED_ROOT or resolved.startswith(APPROVED_ROOT + os.sep)):
+                    continue
+                if resolved != root_real and not resolved.startswith(root_real + os.sep):
+                    continue
+                files_examined += 1
+                size = os.stat(candidate, follow_symlinks=False).st_size
+                if size > max_file_bytes:
+                    skipped_oversized += 1
+                    continue
+                with open(candidate, 'rb') as stream:
+                    raw = stream.read(max_file_bytes + 1)
+                if len(raw) > max_file_bytes:
+                    skipped_oversized += 1
+                    continue
+                if b'\x00' in raw:
+                    skipped_binary += 1
+                    continue
+                try:
+                    text = raw.decode('utf-8')
+                except UnicodeDecodeError:
+                    skipped_invalid_text += 1
+                    continue
+                for line_number, line in enumerate(text.splitlines(), start=1):
+                    if pattern not in line:
+                        continue
+                    encoded = line.encode('utf-8')
+                    was_truncated = len(encoded) > 1024
+                    if was_truncated:
+                        byte_index = len(line[:line.find(pattern)].encode('utf-8'))
+                        start = max(0, byte_index - 256)
+                        excerpt = encoded[start:start + 1024].decode('utf-8', 'ignore')
+                        line_value = ('…' if start else '') + excerpt + ('…' if start + 1024 < len(encoded) else '')
+                    else:
+                        line_value = line
+                    matches.append({'path': candidate, 'line_number': line_number, 'line': line_value,
+                                    'line_truncated': was_truncated})
+                    if len(matches) >= max_matches:
+                        truncated = True
+                        break
+            except (OSError, PermissionError):
+                inaccessible += 1
+            if truncated:
+                break
+        if truncated:
+            break
+    if time.monotonic() >= deadline or files_examined >= max_files:
+        truncated = True
+    return {'root': root_real, 'pattern': pattern, 'matches': matches,
+            'files_examined': files_examined, 'skipped_binary': skipped_binary,
+            'skipped_oversized': skipped_oversized, 'skipped_invalid_text': skipped_invalid_text,
+            'inaccessible_files': inaccessible + walk_errors[0],
+            'truncated': {'matches': truncated, 'files': files_examined >= max_files,
+                          'timeout': time.monotonic() >= deadline}}
 
 def checked_git_dir(repo):
     git_dir = os.path.join(repo, '.git')
@@ -504,6 +630,12 @@ def main():
         start = checked_limit(args.get('start_line'), 1, 10000, 'start_line')
         count = checked_limit(args.get('max_lines'), 200, 300, 'max_lines')
         return search_read(root, args.get('name'), args.get('match'), args.get('result_index', 'auto'), start, count)
+    if op == 'vps_search_content':
+        if any(key not in ('pattern', 'path', 'max_matches', 'max_files', 'max_file_bytes') for key in args):
+            fail('vps_search_content accepts only pattern, path, max_matches, max_files, and max_file_bytes')
+        root = checked_path(args.get('path', APPROVED_ROOT), 'path')
+        return search_content(root, args.get('pattern'), args.get('max_matches'),
+                              args.get('max_files'), args.get('max_file_bytes'))
     if op == 'vps_read':
         path = checked_path(args.get('path'), 'path')
         if not os.path.isfile(path):
@@ -613,6 +745,7 @@ const DEFINITIONS = [
   createDefinition('vps_git_status', 'Read bounded Git status for a repository under /srv/ai-hub; untracked files and optional index locks are omitted.', TOOL_SCHEMAS.vps_git_status),
   createDefinition('vps_git_log', 'Read at most 50 recent commits from a repository under /srv/ai-hub.', TOOL_SCHEMAS.vps_git_log),
   createDefinition('vps_search_read', 'Search filenames under /srv/ai-hub and read a bounded excerpt from one exactly selected regular text file. Use result_index auto only for a unique match; otherwise select a zero-based index from the returned candidates.', TOOL_SCHEMAS.vps_search_read),
+  createDefinition('vps_search_content', 'Search literal text in bounded regular UTF-8 files under /srv/ai-hub. Symlinks, binary files, and files over the selected size limit are skipped; search is read-only and stops at fixed file, match, and time bounds.', TOOL_SCHEMAS.vps_search_content),
   createDefinition('vps_repo_summary', 'Return a bounded read-only overview of one repository under /srv/ai-hub: top-level entries, safe Git status/branch/HEAD/log, and names of selected common metadata files. No file contents are returned.', TOOL_SCHEMAS.vps_repo_summary),
 ]
 

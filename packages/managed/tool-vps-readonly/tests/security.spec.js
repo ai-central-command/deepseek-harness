@@ -6,8 +6,8 @@ import path from 'node:path'
 import test from 'node:test'
 import { REMOTE_HELPER_SOURCE_FOR_TESTS, TOOL_NAMES, TOOL_SCHEMAS, validateArguments, validatePath } from '../src/index.js'
 
-test('registers exactly the seven bounded VPS read tools and schemas', () => {
-  assert.deepEqual(TOOL_NAMES, ['vps_list', 'vps_find', 'vps_read', 'vps_git_status', 'vps_git_log', 'vps_search_read', 'vps_repo_summary'])
+test('registers exactly the eight bounded VPS read tools and schemas', () => {
+  assert.deepEqual(TOOL_NAMES, ['vps_list', 'vps_find', 'vps_read', 'vps_git_status', 'vps_git_log', 'vps_search_read', 'vps_search_content', 'vps_repo_summary'])
   assert.deepEqual(Object.keys(TOOL_SCHEMAS), TOOL_NAMES)
   assert.equal(TOOL_SCHEMAS.vps_read.max_lines.type, 'string')
   assert.equal(TOOL_SCHEMAS.vps_find.max_results.type, 'string')
@@ -18,6 +18,8 @@ test('registers exactly the seven bounded VPS read tools and schemas', () => {
   assert.equal(TOOL_SCHEMAS.vps_repo_summary.repo.type, 'string')
   assert.equal(TOOL_SCHEMAS.vps_repo_summary.max_entries.type, 'string')
   assert.equal(TOOL_SCHEMAS.vps_repo_summary.max_commits.type, 'string')
+  assert.equal(TOOL_SCHEMAS.vps_search_content.pattern.required, true)
+  assert.equal(Object.hasOwn(TOOL_SCHEMAS.vps_search_content.path, 'required'), false)
   assert.equal(TOOL_NAMES.some(name => /shell|write|delete|commit|reset|deploy/i.test(name)), false)
 })
 
@@ -80,6 +82,93 @@ test('validates repo summary scope and result bounds', () => {
     { ...valid, max_commits: '21' },
     { ...valid, max_entries: '-1' },
   ]) assert.throws(() => validateArguments('vps_repo_summary', value))
+})
+
+test('validates bounded literal content-search inputs and rejects injection or mutation-shaped requests', () => {
+  assert.deepEqual(validateArguments('vps_search_content', { pattern: 'AC-OBS-001' }), {
+    pattern: 'AC-OBS-001', path: '/srv/ai-hub', max_matches: 50, max_files: 10000, max_file_bytes: 8 * 1024 * 1024,
+  })
+  for (const args of [
+    { pattern: '' },
+    { pattern: 'x\ny' },
+    { pattern: 'x;id' },
+    { pattern: '$(id)' },
+    { pattern: 'x`id`' },
+    { pattern: 'x|cat /etc/passwd' },
+    { pattern: 'x'.repeat(257) },
+    { pattern: 'valid', path: '/etc' },
+    { pattern: 'valid', path: '/srv/ai-hub/../../etc' },
+    { pattern: 'valid', max_matches: 201 },
+    { pattern: 'valid', max_files: 10001 },
+    { pattern: 'valid', max_file_bytes: 8 * 1024 * 1024 + 1 },
+    { pattern: 'valid', max_files: '10000;touch /tmp/pwned' },
+    { pattern: 'valid', command: 'rm -rf /' },
+  ]) assert.throws(() => validateArguments('vps_search_content', args))
+  assert.throws(() => validateArguments('python', { executable: 'python3', args: ['-c', 'id'] }))
+  assert.throws(() => validateArguments('vps_write', { path: '/srv/ai-hub/x', content: 'mutate' }))
+})
+
+test('remote content search returns bounded literal matches and skips binary, oversized, and symlink files', t => {
+  const temp = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dsh-vps-content-search-')))
+  t.after(() => rmSync(temp, { recursive: true, force: true }))
+  const outside = path.join(path.dirname(temp), `${path.basename(temp)}-outside.txt`)
+  writeFileSync(outside, 'needle outside\n')
+  t.after(() => rmSync(outside, { force: true }))
+  mkdirSync(path.join(temp, 'nested'))
+  writeFileSync(path.join(temp, 'nested', 'match.txt'), 'first needle\nsecond needle\n')
+  writeFileSync(path.join(temp, 'nested', 'z-long-line.txt'), `${'x'.repeat(1500)}needle${'y'.repeat(600)}\n`)
+  writeFileSync(path.join(temp, 'binary.bin'), Buffer.from([0, 1, 2, 3]))
+  writeFileSync(path.join(temp, 'oversized.txt'), 'needle'.repeat(1000))
+  symlinkSync(outside, path.join(temp, 'linked.txt'))
+  symlinkSync(outside, path.join(temp, 'escape-dir'))
+
+  const valid = runRemote(temp, 'vps_search_content', {
+    path: temp, pattern: 'needle', max_matches: 1, max_files: 20, max_file_bytes: 4096,
+  })
+  assert.equal(valid.status, 0)
+  assert.equal(valid.result.matches.length, 1)
+  assert.equal(valid.result.matches[0].path, path.join(temp, 'nested', 'match.txt'))
+  assert.equal(valid.result.matches[0].line_number, 1)
+  assert.match(valid.result.matches[0].line, /needle/)
+  assert.equal(valid.result.truncated.matches, true)
+  assert.equal(valid.result.skipped_binary, 1)
+  assert.equal(valid.result.skipped_oversized, 1)
+  assert.equal(valid.result.matches.every(match => match.path === temp || match.path.startsWith(temp + path.sep)), true)
+
+  const oneFile = runRemote(temp, 'vps_search_content', {
+    path: temp, pattern: 'needle', max_matches: 20, max_files: 1, max_file_bytes: 4096,
+  })
+  assert.equal(oneFile.status, 0)
+  assert.equal(oneFile.result.files_examined, 1)
+  assert.equal(oneFile.result.truncated.files, true)
+
+  const boundedLine = runRemote(temp, 'vps_search_content', {
+    path: temp, pattern: 'needle', max_matches: 20, max_files: 20, max_file_bytes: 4096,
+  })
+  const longMatch = boundedLine.result.matches.find(match => match.path === path.join(temp, 'nested', 'z-long-line.txt'))
+  assert.equal(longMatch.line_truncated, true)
+  assert.ok(Buffer.byteLength(longMatch.line, 'utf8') <= 1028)
+
+  const invalidPath = runRemote(temp, 'vps_search_content', { path: path.join(temp, '..'), pattern: 'needle' })
+  assert.equal(invalidPath.status, 2)
+  assert.match(invalidPath.result.error, /must remain under|resolves outside/)
+})
+
+test('remote content search enforces remote argument bounds and rejects control or shell syntax', t => {
+  const temp = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'dsh-vps-content-search-')))
+  t.after(() => rmSync(temp, { recursive: true, force: true }))
+  for (const arguments_ of [
+    { path: temp, pattern: 'x\ncommand' },
+    { path: temp, pattern: 'x;id' },
+    { path: temp, pattern: '$(id)' },
+    { path: temp, pattern: 'x', max_matches: 201 },
+    { path: temp, pattern: 'x', max_files: 10001 },
+    { path: temp, pattern: 'x', max_file_bytes: 8 * 1024 * 1024 + 1 },
+  ]) {
+    const result = runRemote(temp, 'vps_search_content', arguments_)
+    assert.equal(result.status, 2)
+  }
+  assert.equal(TOOL_NAMES.some(name => /shell|write|delete|commit|reset|deploy/i.test(name)), false)
 })
 
 function runRemote(approved, tool, arguments_) {

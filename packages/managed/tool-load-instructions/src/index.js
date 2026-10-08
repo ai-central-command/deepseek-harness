@@ -7,7 +7,7 @@ export const inject = ['tools']
 
 const TOOL_NAME = 'load_instructions'
 const CONTEXT_NAME = 'current_runtime_context'
-const VPS_READ_TOOLS = Object.freeze(['vps_list', 'vps_find', 'vps_read', 'vps_git_status', 'vps_git_log', 'vps_search_read', 'vps_repo_summary'])
+const VPS_READ_TOOLS = Object.freeze(['vps_list', 'vps_find', 'vps_read', 'vps_git_status', 'vps_git_log', 'vps_search_read', 'vps_search_content', 'vps_repo_summary'])
 const MANAGED_TOOLS = Object.freeze([TOOL_NAME, ...VPS_READ_TOOLS])
 
 function currentRuntimeContext(agent) {
